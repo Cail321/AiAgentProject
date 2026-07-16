@@ -1,0 +1,17 @@
+# 保护 API Key
+utils/config.py
+
+# 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 日志
+logs/
+*.log
