@@ -1,5 +1,8 @@
 # 保护 API Key
 utils/config.py
+.env
+.env.*
+!.env.example
 
 # 虚拟环境
 .venv/
