@@ -1,77 +1,93 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║  eval/evaluator.py — 对话质量评估                             ║
-║                                                             ║
-║  作用：                                                       ║
-║    1. 记录 Agent 的每一步操作（哪个工具被调用、耗时多久）         ║
-║    2. 对话结束后自动打分                                       ║
-║    3. 保存日志到文件（方便面试时展示"你会做评估"）                ║
-║                                                             ║
-║  为什么需要这个模块？                                          ║
-║    截图JD明确要求："跟踪 Agent 的运行轨迹，定位逻辑缺陷，         ║
-║    进行端到端的性能调优"。这个模块就是为此设计的。                ║
-║                                                             ║
-║  依赖关系：                                                    ║
-║    evaluator.py 被 agent/core.py 调用（每轮对话后记录）        ║
-║    evaluator.py 被 main.py 调用（初始化时传入 Agent）          ║
-║                                                             ║
-║  你需要实现：                                                  ║
-║    class Evaluator:                                          ║
-║      def __init__(self, log_dir="logs")                      ║
-║      def log_turn(self, user_input, agent_output,            ║
-║                    tool_calls, iterations, duration)          ║
-║      def score(self) -> dict         ← 自动评分              ║
-║      def save_log(self)              ← 保存到 JSON 文件      ║
-║                                                             ║
-║  评分维度（面试时可以说的）：                                   ║
-║    1. 工具调用次数：少 = 高效                                   ║
-║    2. 是否找到相关文档：RAG 命中率                              ║
-║    3. 是否超最大轮次：死循环检测                                ║
-║    4. 用户问题复杂度：用于分类统计                               ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+"""记录 Agent 运行轨迹，并提供基础的离线统计指标。"""
+
+import json
+from datetime import datetime
+from pathlib import Path
+
 
 class Evaluator:
+    """保存单轮轨迹，并汇总效率、工具调用和超时指标。"""
+
     def __init__(self, log_dir: str = "logs"):
-        self.log_dir = log_dir
-        self.current_trace = []  # 当前对话的每一步
-        self.all_sessions = []  # 所有对话记录
+        self.log_dir = Path(log_dir)
+        self.current_trace: list[dict] = []
+        self.all_sessions: list[dict] = []
 
-    def log_tool_call(self, tool_name: str, args: dict, result: str, duration: float):
-        """记录一次工具调用"""
-        # 记录：工具名、参数、结果、耗时
-        self.current_trace.append((tool_name, args, result, duration))
+    def log_tool_call(self, tool_name: str, args: dict, result: str, duration: float) -> None:
+        """记录一次工具调用及其耗时。"""
+        self.current_trace.append(
+            {
+                "tool_name": tool_name,
+                "args": args,
+                "result": result,
+                "duration": round(duration, 6),
+            }
+        )
 
-    def log_final_answer(self, question: str, answer: str, total_iterations: int, total_duration: float):
-        """记录一轮对话的最终结果"""
-        session = {
-            "question": question,
-            "answer": answer,
-            "total_iterations": total_iterations,
-            "total_duration": total_duration,
-            "tool_calls": self.current_trace.copy()
-        }
-        self.all_sessions.append(session)
+    def log_final_answer(
+        self,
+        question: str,
+        answer: str,
+        total_iterations: int,
+        total_duration: float,
+    ) -> None:
+        """结束一轮对话并保存最终回答。"""
+        self.all_sessions.append(
+            {
+                "question": question,
+                "answer": answer,
+                "total_iterations": total_iterations,
+                "total_duration": round(total_duration, 6),
+                "tool_calls": self.current_trace.copy(),
+            }
+        )
         self.current_trace = []
 
     def score(self) -> dict:
-        """对当前对话自动评分"""
-        # 返回 {"efficiency": 0-10, "tool_usage": int, "hit_rag": bool, "timeout": bool}
+        """汇总当前评估器中的基础运行指标。"""
         if not self.all_sessions:
-            return {"total": 0}
-        else:
-            total = len(self.all_sessions)
-            avg_iter = sum(s["total_iterations"] for s in self.all_sessions) / total
-            efficiency = round(max(0.0, 10.0 - avg_iter * 2), 1)
+            return {"total_sessions": 0}
+
+        total = len(self.all_sessions)
+        tool_calls = [call for session in self.all_sessions for call in session["tool_calls"]]
+        rag_calls = [call for call in tool_calls if call["tool_name"] == "search_knowledge"]
+        rag_hits = [
+            call for call in rag_calls
+            if "没有找到足够相关" not in call["result"]
+            and "未初始化" not in call["result"]
+        ]
+        timeout_sessions = [
+            session for session in self.all_sessions
+            if "超过上限" in session["answer"] or "超时" in session["answer"]
+        ]
+        avg_iterations = sum(item["total_iterations"] for item in self.all_sessions) / total
+        efficiency = round(max(0.0, 10.0 - avg_iterations * 2), 2)
         return {
             "total_sessions": total,
-            "avg_iterations": avg_iter,
+            "total_tool_calls": len(tool_calls),
+            "avg_iterations": round(avg_iterations, 2),
+            "avg_duration_seconds": round(
+                sum(item["total_duration"] for item in self.all_sessions) / total,
+                4,
+            ),
+            "rag_calls": len(rag_calls),
+            "rag_hit_rate": round(len(rag_hits) / len(rag_calls), 2) if rag_calls else 0.0,
+            "timeout_rate": round(len(timeout_sessions) / total, 2),
             "efficiency_score": efficiency,
         }
 
-    def save(self):
-        """保存本轮对话日志到 logs/ 目录（JSON 格式）"""
-        # 文件名：logs/session_20260715_001500.json
+    def save(self) -> Path:
+        """将当前会话和汇总指标保存为 JSON 文件。"""
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = self.log_dir / f"session_{timestamp}.json"
+        payload = {"score": self.score(), "sessions": self.all_sessions}
+        output_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return output_path
 
-    def reset(self):
+    def reset(self) -> None:
+        """清空尚未结束的当前轨迹，不删除已完成会话。"""
         self.current_trace = []

@@ -1,86 +1,78 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║  agent/memory.py — 对话记忆管理                               ║
-║                                                             ║
-║  作用：管理 Agent 的对话历史。                                  ║
-║    1. 存储每条消息（system/user/assistant/tool）               ║
-║    2. 控制上下文长度（token 预算管理）                          ║
-║    3. 支持"遗忘"旧的对话轮次（滑动窗口）                         ║
-║                                                             ║
-║  为什么需要专门的 memory 模块？                                ║
-║    - LLM 有 context window 限制（比如 Qwen 最大 32K tokens）   ║
-║    - 对话太长会超出限制，API 报错                                ║
-║    - 需要策略来压缩或丢弃旧消息                                  ║
-║                                                             ║
-║  依赖关系：                                                    ║
-║    memory.py 被 agent/core.py 调用                            ║
-║    memory.py 不依赖其他项目模块（独立工具）                      ║
-║                                                             ║
-║  你需要实现：                                                  ║
-║    class Memory:                                             ║
-║      def __init__(self, system_prompt, max_tokens=8000)      ║
-║      def add(self, role, content, tool_calls=None)           ║
-║      def get_messages(self) -> list[dict]                    ║
-║      def count_tokens(self) -> int     ← 估算当前 tokens 数   ║
-║      def compress(self)               ← 超出限制时压缩/遗忘   ║
-║      def clear(self)                  ← 重置对话             ║
-║                                                             ║
-║  面试要点：                                                    ║
-║    Q: 怎么估算 token 数？                                      ║
-║    A: 粗略法：中文 1 字≈1-2 token，英文 1 词≈1.3 token。        ║
-║       精确法：用 tiktoken 库计算。这里用粗略法就够了。           ║
-║                                                             ║
-║    Q: 有哪些记忆管理策略？                                     ║
-║    A: 1) 滑动窗口：只保留最近 N 轮                              ║
-║       2) 摘要压缩：把旧对话让 LLM 总结成一段，替换原始消息        ║
-║       3) 向量检索：把所有历史存向量库，每次检索相关部分           ║
-║       我们先用滑动窗口，这是最实用的基线。                        ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+"""管理 Agent 的对话消息和上下文长度。"""
+
+import json
+from typing import Any
+
 
 class Memory:
+    """使用滑动窗口保留系统提示词和最近的完整对话轮次。"""
+
     def __init__(self, system_prompt: str, max_tokens: int = 8000):
+        if max_tokens <= 0:
+            raise ValueError("max_tokens 必须大于 0")
         self.messages = [{"role": "system", "content": system_prompt}]
         self.max_tokens = max_tokens
 
-    def add(self, role: str, content: str = None, tool_calls = None, tool_call_id=None, name = None):
-        """添加一条消息到记忆"""
-        # 构建消息 dict，追加到 self.messages
-        msg = {"role": role, "content": content}
-        #判断tool_calls是否为空,防止null值报错
+    @staticmethod
+    def _to_jsonable(value: Any) -> Any:
+        """将 OpenAI 对象或普通对象转换成可传给 API 的字典。"""
+        if hasattr(value, "model_dump"):
+            return value.model_dump(exclude_none=True)
+        if isinstance(value, list):
+            return [Memory._to_jsonable(item) for item in value]
+        if isinstance(value, dict):
+            return {key: Memory._to_jsonable(item) for key, item in value.items()}
+        return value
+
+    def add(
+        self,
+        role: str,
+        content: str | None = None,
+        tool_calls: list[Any] | None = None,
+        tool_call_id: str | None = None,
+        name: str | None = None,
+    ) -> None:
+        """追加消息，并在超出预算时裁剪旧对话。"""
+        message: dict[str, Any] = {"role": role, "content": content}
         if tool_calls is not None:
-            msg["tool_calls"] = tool_calls
+            message["tool_calls"] = self._to_jsonable(tool_calls)
         if tool_call_id is not None:
-            msg["tool_call_id"] = tool_call_id
+            message["tool_call_id"] = tool_call_id
         if name is not None:
-            msg["name"] = name
-        self.messages.append(msg)
-        # 调用 self.compress() 检查是否超出限制
+            message["name"] = name
+        self.messages.append(message)
         self.compress()
 
-    def get_messages(self) -> list:
-        """返回当前完整对话历史（传给 LLM）"""
+    def get_messages(self) -> list[dict[str, Any]]:
+        """返回可直接传入聊天接口的消息列表。"""
         return self.messages
 
     def count_tokens(self) -> int:
-        """粗略估算当前 messages 的总 token 数"""
-        # 中文约 1 字 ≈ 1.5 tokens，英文约 1 词 ≈ 1.3 tokens(精准计算token时间复杂度O(n**2))
-        # 改为len()粗略计算
-        total = 0
-        for msg in self.messages:
-            text = str(msg.get("content", "") or "")
-            total += len(text)
-        return total
+        """粗略估算上下文长度，生产环境可替换为模型对应的 tokenizer。"""
+        return sum(
+            len(json.dumps(message, ensure_ascii=False, default=str))
+            for message in self.messages
+        )
 
-    def compress(self):
-        """滑动窗口策略：保留 system_prompt + 最近 N 轮对话"""
-        # 如果 token 数不超限，不处理
-        # 如果超限，从最早的非 system 消息开始删除
-        # 确保 system_prompt 永远在第一位
-        while self.count_tokens() > self.max_tokens and len(self.messages) > 1:
-            self.messages.pop(1)
+    def _drop_oldest_turn(self) -> bool:
+        """删除最早的一轮用户对话及其后续工具调用消息。"""
+        user_indices = [
+            index for index, message in enumerate(self.messages[1:], start=1)
+            if message.get("role") == "user"
+        ]
+        # 只有一轮当前对话时不能删除用户问题，否则下一次请求会失去上下文。
+        if len(user_indices) < 2:
+            return False
 
+        first_user, next_user = user_indices[0], user_indices[1]
+        del self.messages[first_user:next_user]
+        return True
 
-    def clear(self):
-        """重置对话（只保留 system_prompt）"""
+    def compress(self) -> None:
+        """按完整对话轮次裁剪，避免留下孤立的工具调用结果。"""
+        while self.count_tokens() > self.max_tokens and self._drop_oldest_turn():
+            pass
+
+    def clear(self) -> None:
+        """重置对话，只保留系统提示词。"""
         self.messages = [self.messages[0]]

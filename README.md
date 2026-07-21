@@ -67,10 +67,12 @@ AiAgentProject/
 ├── eval/
 │   └── evaluator.py          # 对话轨迹记录 + 自动评分
 ├── utils/
-│   ├── config.example.py     # 配置模板（复制为 config.py）
-│   └── config.py             # 实际配置（API Key，已 gitignore）
+│   ├── config.example.py     # 安全配置模板
+│   └── config.py             # 本地配置（从环境变量读取，已 gitignore）
 ├── data/
 │   └── company_docs.txt      # 模拟电商知识库
+├── tests/
+│   └── test_core_modules.py   # 不依赖网络的基础测试
 └── requirements.txt
 ```
 
@@ -88,7 +90,21 @@ pip install -r requirements.txt
 cp utils/config.example.py utils/config.py
 ```
 
-编辑 `utils/config.py`，填入你的 API Key：
+在终端设置环境变量，不要把真实密钥写入 `config.py`：
+
+```bash
+export LLM_API_KEY="你的 DeepSeek Key"
+export EMBEDDING_API_KEY="你的 DashScope Key"
+```
+
+Windows PowerShell：
+
+```powershell
+$env:LLM_API_KEY="你的 DeepSeek Key"
+$env:EMBEDDING_API_KEY="你的 DashScope Key"
+```
+
+当前程序不会自动加载 `.env` 文件，因此仅修改 `.env` 不会生效。
 
 - **LLM**：DeepSeek API（[platform.deepseek.com](https://platform.deepseek.com)）
 - **Embedding**：DashScope（阿里云，[dashscope.aliyun.com](https://dashscope.aliyun.com)）
@@ -99,7 +115,13 @@ cp utils/config.example.py utils/config.py
 python main.py
 ```
 
-### 4. 交互
+### 4. 运行基础测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+### 5. 交互
 
 ```
 请输入问题：我是钻石会员，买智能手环X1和无线耳机E3要多少钱？
@@ -127,7 +149,7 @@ python main.py
 Thought → Action → Observation → Thought → ... → Answer
 ```
 
-不依赖 LangChain，核心就是一个 `while` 循环：调 LLM → 判断是否调工具 → 执行工具 → 结果喂回 LLM → 继续，直到 LLM 认为可以回答。
+不依赖 LangChain，核心就是一个有最大次数限制的循环：调用 LLM → 判断是否调工具 → 执行工具 → 结果喂回 LLM → 继续，直到 LLM 认为可以回答。
 
 ### RAG 管道
 
@@ -147,7 +169,7 @@ Thought → Action → Observation → Thought → ... → Answer
 
 - 记录每轮对话的工具调用轨迹（工具名、参数、结果）
 - 自动计算效率分（迭代越少分越高）、平均迭代次数
-- 可扩展为持久化日志 + 可视化面板
+- 在退出时将会话轨迹和汇总指标保存为 JSON 日志，可继续接入可视化面板
 
 ## 📊 RAG 优化方向
 

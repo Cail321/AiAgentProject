@@ -1,171 +1,152 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║  agent/tools.py — 工具定义与执行                              ║
-║                                                             ║
-║  作用：Agent 的"手脚"。每个工具就是一个 Python 函数，            ║
-║  外加一份 JSON Schema 描述，让 LLM 知道这个工具能干什么。        ║
-║                                                             ║
-║  依赖关系：                                                    ║
-║    tools.py 被 agent/core.py 调用（执行工具）                   ║
-║    tools.py 被 main.py 调用（注册工具列表传给 Agent）           ║
-║    tools.py 调用 → rag/retriever.py（RAG_search 工具）        ║
-║                                                             ║
-║  你需要实现 4-5 个工具：                                       ║
-║    1. calculator           — 数学计算                         ║
-║    2. get_current_time     — 查询当前时间                     ║
-║    3. search_knowledge     — RAG 知识库检索（核心！）          ║
-║    4. get_order_status     — 查询订单状态（模拟数据库查询）     ║
-║    5. transfer_to_human    — 转人工客服（模拟）                ║
-║                                                             ║
-║  每个工具分两部分：                                              ║
-║    A. TOOL_SCHEMAS: 工具描述列表（JSON Schema），传给 LLM       ║
-║    B. execute_tool():  根据工具名执行对应的 Python 函数         ║
-║                                                             ║
-║  面试要点：                                                    ║
-║    Q: 为什么工具描述用 JSON Schema？                            ║
-║    A: 这是 OpenAI Function Calling 的标准格式。LLM 通过         ║
-║       description 字段理解工具用途，通过 parameters 知道        ║
-║       需要传什么参数、什么类型。                                  ║
-║                                                             ║
-║    Q: execute_tool 里为什么要用 try/except？                   ║
-║    A: LLM 可能传错误的参数格式，工具执行不能崩，要把错误          ║
-║       信息作为正常结果返回给 LLM，让它自己修正。                   ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+"""定义并执行 Agent 可调用的工具。"""
+
+import ast
 import datetime
+import operator
+from typing import Callable
+
+
+_BINARY_OPERATORS: dict[type[ast.operator], Callable[[float, float], float]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_UNARY_OPERATORS: dict[type[ast.unaryop], Callable[[float], float]] = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+def _safe_calculate(expression: str) -> float:
+    """只允许数字和白名单运算符，避免直接执行任意 Python 代码。"""
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("表达式不能为空")
+    if len(expression) > 100:
+        raise ValueError("表达式过长")
+
+    tree = ast.parse(expression, mode="eval")
+
+    def evaluate(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPERATORS:
+            return _UNARY_OPERATORS[type(node.op)](evaluate(node.operand))
+        if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("幂运算指数过大")
+            return _BINARY_OPERATORS[type(node.op)](left, right)
+        raise ValueError("表达式包含不支持的语法")
+
+    return evaluate(tree)
+
 
 def create_tools(retriever=None, order_db=None):
-    """工厂函数：接收外部依赖，返回 (工具描述列表, 执行函数)"""
+    """创建工具描述和执行函数，并注入检索器、订单数据等外部依赖。"""
     if order_db is None:
         order_db = {"ORD001": "已发货", "ORD002": "处理中", "ORD003": "待付款"}
-    # 1. 构建 TOOL_SCHEMAS（一个 list，包含上面4-5
+
     schemas = [
-        # 工具1: calculator — 数学表达式的计算器
         {
             "type": "function",
-            "function":{
+            "function": {
                 "name": "calculator",
-                "description": "执行数学计算。支持加减乘除、幂运算等。",
+                "description": "执行基础数学计算，支持加减乘除、取模、整除和幂运算。",
                 "parameters": {
                     "type": "object",
-                    "properties":{
-                        "expression":{
-                            "type": "string",
-                            "description": "数学表达式，例如'(3+5)*2'"
-                        }
+                    "properties": {
+                        "expression": {"type": "string", "description": "例如：'(3+5)*2'"}
                     },
-                    "required": ["expression"]
-                }
-            }
-        },
-        # 工具2: get_current_time — 获取当前日期时间，无需参数
-        {
-            "type": "function",
-            "function":{
-                "name": "get_current_time",
-                "description": "获取当前时间和日期。",
-                "parameters": {
-                    "type": "object",
-                    "properties":{},
-                    "required": []
+                    "required": ["expression"],
+                    "additionalProperties": False,
                 },
-            }
+            },
         },
-        # 工具3: search_knowledge — RAG知识库检索，参数 query: str
-        # 这个工具需要从外部传入 retriever 对象，所以用工厂函数 create_tools(retriever)
         {
             "type": "function",
-            "function":{
+            "function": {
+                "name": "get_current_time",
+                "description": "获取当前日期和时间。",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "search_knowledge",
-                "description": "进行RAG知识库检索。",
+                "description": "检索电商产品、物流、会员和退换货知识库。",
                 "parameters": {
                     "type": "object",
-                    "properties":{
-                        "query":{
-                            "type": "string",
-                            "description": "用户提出的问题。"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
+                    "properties": {"query": {"type": "string", "description": "需要检索的问题"}},
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        # 工具4: get_order_status — 查询订单状态，参数 order_id: str
-        # 模拟数据库：用一个 dict 存储 {"ORD001": "已发货", "ORD002": "处理中"}
         {
             "type": "function",
-            "function":{
+            "function": {
                 "name": "get_order_status",
-                "description": "查询订单状态。",
+                "description": "根据订单编号查询订单状态。",
                 "parameters": {
                     "type": "object",
-                    "properties":{
-                        "order_id":{
-                            "type": "string",
-                            "description": "查询的订单编号。"
-                        }
-                    },
-                    "required": ["order_id"]
-                }
-            }
+                    "properties": {"order_id": {"type": "string", "description": "订单编号"}},
+                    "required": ["order_id"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        # 工具5: transfer_to_human — 转接人工客服，参数 reason: str
         {
             "type": "function",
-            "function":{
+            "function": {
                 "name": "transfer_to_human",
-                "description": "转接人工客服",
+                "description": "将复杂、敏感或无法解决的问题转交人工客服。",
                 "parameters": {
                     "type": "object",
-                    "properties":{
-                        "reason":{
-                            "type": "string",
-                            "description": "转接人工客服。"
-                        }
-                    },
-                    "required": ["reason"]
-                }
-            }
-        }
+                    "properties": {"reason": {"type": "string", "description": "转人工原因"}},
+                    "required": ["reason"],
+                    "additionalProperties": False,
+                },
+            },
+        },
     ]
-    # 2. 定义 execute_tool(name, args) 函数
-    #    - 根据 name 路由到具体工具
-    #    - search_knowledge 调用 retriever 对象
-    #    - get_order_status 查询 order_db
-    def execute_tool(name, args):
+
+    def execute_tool(name: str, args: dict) -> str:
+        """根据工具名路由执行，并将异常转换为可供 Agent 理解的结果。"""
         try:
+            args = args or {}
             if name == "calculator":
-                result = eval(args["expression"])
-                return str(result)
-
-            elif name == "get_current_time":
+                return str(_safe_calculate(args["expression"]))
+            if name == "get_current_time":
                 return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            elif name == "search_knowledge":
+            if name == "search_knowledge":
                 if retriever is None:
-                    return "知识库未初始化，请联系管理员"
+                    return "知识库未初始化，请联系管理员。"
                 results = retriever.search(args["query"])
-                return "找到以下相关信息：\n" + "\n".join([r["content"] for r in results])
+                if not results:
+                    return "知识库中没有找到足够相关的信息。"
+                return "找到以下相关信息：\n" + "\n".join(
+                    f"[{item['score']:.3f}] {item['content']}" for item in results
+                )
+            if name == "get_order_status":
+                order_id = str(args["order_id"]).strip().upper()
+                return f"订单{order_id}状态：{order_db.get(order_id, '未找到该订单')}"
+            if name == "transfer_to_human":
+                reason = str(args.get("reason", "未说明")).strip()
+                return f"已转接人工客服，原因：{reason}"
+            return f"未知工具：{name}"
+        except KeyError as exc:
+            return f"缺少必要参数：{exc.args[0]}"
+        except (ValueError, SyntaxError, ZeroDivisionError, OverflowError) as exc:
+            return f"工具参数或计算错误：{exc}"
+        except Exception as exc:
+            return f"工具执行出错：{exc}"
 
-            elif name == "get_order_status":
-                order_id = args["order_id"]
-                if order_id in order_db:
-                    return f"订单{order_id}状态：{order_db[order_id]}"
-                else:
-                    return f"未找到订单{order_id}"
-
-            elif name == "transfer_to_human":
-                return f"转接人工客服，原因：{args.get('reason','未说明')}"
-
-            else:
-                return f"未知工具{name}"
-        except KeyError as e:
-            return f"缺少必要参数{e}"
-
-        except ZeroDivisionError as e:
-            return f"除以零错误"
-
-        except Exception as e:
-            return f"工具‘{name}’执行出错:{e}"
-    # 3. 返回 (TOOL_SCHEMAS, execute_tool)
     return schemas, execute_tool

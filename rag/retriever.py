@@ -1,108 +1,88 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║  rag/retriever.py — 知识库检索器                              ║
-║                                                             ║
-║  作用：                                                       ║
-║    1. 加载文档 → 切片（chunking）                              ║
-║    2. 每个切片生成向量 → 存起来（索引）                          ║
-║    3. 用户提问时，把问题也转成向量                               ║
-║    4. 用余弦相似度找到最相关的 top_k 个切片                     ║
-║                                                             ║
-║  依赖关系：                                                    ║
-║    retriever.py 被 agent/tools.py 调用（作为 search_knowledge 工具的后端）  ║
-║    retriever.py 调用 → rag/embedder.py（生成向量）              ║
-║    retriever.py 被 main.py 调用（初始化时加载文档）              ║
-║                                                             ║
-║  你需要实现：                                                  ║
-║    class Retriever:                                          ║
-║      def __init__(self, embedder: Embedder)                  ║
-║      def load_documents(self, file_path: str)                ║
-║      def chunk_text(self, text: str, chunk_size=300)         ║
-║      def build_index(self)                                   ║
-║      def search(self, query: str, top_k=3) -> list[dict]     ║
-║                                                             ║
-║  面试要点：                                                    ║
-║    Q: 切片大小怎么选？                                          ║
-║    A: 太小（<100字）语义不完整；太大（>500字）检索不精确。         ║
-║       300字左右是经验值。中文按句号/段落切，英文按句子切。         ║
-║                                                             ║
-║    Q: 余弦相似度是什么？                                       ║
-║    A: 衡量两个向量在方向上有多接近。=1 表示完全同向（语义相同），   ║
-║       =0 表示正交（语义无关）。公式：cos = A·B / (|A|·|B|)      ║
-║                                                             ║
-║    Q: 如果知识库有 10000 篇文档，每次搜索要遍历全部向量吗？       ║
-║    A: 暴力遍历 O(n) 在小规模（<1万）够用。生产环境用向量数据库    ║
-║       （如 ChromaDB、Milvus、Pinecone），它们用 ANN 近似算法    ║
-║       把复杂度降到 O(log n)。                                  ║
-╚══════════════════════════════════════════════════════════════╝
-"""
-import numpy as np
-import re
-from utils.config import CHUNK_SIZE, TOP_K_RETRIEVAL
-class Retriever:
-    def __init__(self, embedder):
-        self.embedder = embedder         # Embedder 实例
-        self.chunks = []                 # 文档片段列表
-        self.embeddings = []             # 每个片段对应的向量
+"""实现轻量级的文档切分、向量索引和相似度检索。"""
 
-    def load_documents(self, file_path: str):
-        """从文件加载文档"""
-        # 读取 data/ 目录下的 .txt 文件
-        # 调用 chunk_text 切片
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        self.chunks = self.chunk_text(content, chunk_size=300)
+import re
+from pathlib import Path
+
+import numpy as np
+
+from utils.config import CHUNK_SIZE, TOP_K_RETRIEVAL
+
+
+class Retriever:
+    """在内存中保存文档片段及其向量，并使用余弦相似度检索。"""
+
+    def __init__(self, embedder):
+        self.embedder = embedder
+        self.chunks: list[str] = []
+        self.embeddings: list[list[float]] = []
+
+    def load_documents(self, file_path: str) -> None:
+        """读取文本文件、切分文档并构建向量索引。"""
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"知识库文件不存在：{path}")
+        content = path.read_text(encoding="utf-8")
+        self.chunks = self.chunk_text(content)
         self.build_index()
 
-    def chunk_text(self,
-                   text: str,
-                   chunk_size: int = CHUNK_SIZE) -> list[str]:
-        """文档切片 — 按段落+句号切，保证语义完整"""
-        # 策略：优先按 \n\n 切（段落），然后按。！？切（句子）
-        # 每个 chunk 尽量接近 chunk_size，但不在句子中间切断
-        split_text = text.split('\n\n')
-        split_chunk = []
-        for chunk in split_text:
-            if len(chunk) > chunk_size:
-                short_chunk = re.split(r'[。！？]',chunk)
-                current_chunk = ""
-                for i in short_chunk:
-                    if not i:
-                        continue
-                    elif len(current_chunk) + len(i) > chunk_size:
-                        split_chunk.append(current_chunk)
-                        current_chunk = i
-                    else:
-                        current_chunk += i
-                if current_chunk:
-                    split_chunk.append(current_chunk)
-            elif len(chunk) <= chunk_size:
-                split_chunk.append(chunk)
-        split_chunk = [c for c in split_chunk if c.strip()]
-        return split_chunk
+    def chunk_text(self, text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+        """优先按段落和句子切分，过长句子再按长度切分。"""
+        if not text or chunk_size <= 0:
+            return []
 
-    def build_index(self):
-        """为所有切片生成向量索引"""
-        self.embeddings = self.embedder.embed_batch(self.chunks)
+        chunks: list[str] = []
+        paragraphs = re.split(r"\n\s*\n", text.strip())
+        for paragraph in paragraphs:
+            sentences = [
+                sentence.strip()
+                for sentence in re.split(r"(?<=[。！？!?；;])", paragraph)
+                if sentence.strip()
+            ]
+            current = ""
+            for sentence in sentences:
+                if len(sentence) > chunk_size:
+                    if current:
+                        chunks.append(current.strip())
+                        current = ""
+                    chunks.extend(
+                        sentence[index:index + chunk_size].strip()
+                        for index in range(0, len(sentence), chunk_size)
+                    )
+                elif len(current) + len(sentence) > chunk_size:
+                    if current:
+                        chunks.append(current.strip())
+                    current = sentence
+                else:
+                    current += sentence
+            if current:
+                chunks.append(current.strip())
 
-    def search(self,
-               query: str,
-               top_k: int = TOP_K_RETRIEVAL) -> list[dict]:
-        """语义搜索 — 输入问题，返回最相关的文档片段"""
-        # 1. query 转向量
-        # 2. 计算与每个 chunk 的余弦相似度
-        # 3. 排序取 top_k
-        # 4. 返回 [{"score": float, "content": str}, ...]
-        query_vec = self.embedder.embed(query)
-        result = []
-        # 使用 zip 同时遍历向量和文本
-        for chunk_vec, chunk_text in zip(self.embeddings, self.chunks):
-            # 计算余弦相似度
-            score = np.dot(query_vec, chunk_vec) / (np.linalg.norm(query_vec) * np.linalg.norm(chunk_vec))
-            # 直接拿到 chunk_text，原本使用chunks[i]索引用来取文本。
-            result.append((score, chunk_text))
+        return [chunk for chunk in chunks if chunk]
 
-        # 按分数降序排序
-        result.sort(key=lambda x: x[0], reverse=True)
-        return [{"score": r[0], "content": r[1]} for r in result[:top_k]]
+    def build_index(self) -> None:
+        """批量调用 Embedding 服务生成索引。"""
+        self.embeddings = self.embedder.embed_batch(self.chunks) if self.chunks else []
+        if len(self.embeddings) != len(self.chunks):
+            raise ValueError("向量数量与文档片段数量不一致")
 
+    def search(self, query: str, top_k: int = TOP_K_RETRIEVAL) -> list[dict]:
+        """返回按余弦相似度排序的文档片段及分数。"""
+        if not query or not query.strip() or not self.chunks or top_k <= 0:
+            return []
+
+        query_vector = np.asarray(self.embedder.embed(query), dtype=float)
+        query_norm = np.linalg.norm(query_vector)
+        if query_norm == 0:
+            return []
+
+        results = []
+        for chunk, embedding in zip(self.chunks, self.embeddings):
+            chunk_vector = np.asarray(embedding, dtype=float)
+            chunk_norm = np.linalg.norm(chunk_vector)
+            if chunk_norm == 0:
+                continue
+            score = float(np.dot(query_vector, chunk_vector) / (query_norm * chunk_norm))
+            results.append({"score": score, "content": chunk})
+
+        results.sort(key=lambda item: item["score"], reverse=True)
+        return results[:top_k]
